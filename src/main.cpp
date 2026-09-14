@@ -23,6 +23,7 @@ static bool connected = false;
 static String boundMac;
 static String lastRx;
 static String lastStatus = "booting";
+static String serialLine;
 
 struct ScanItem {
     String mac;
@@ -30,7 +31,14 @@ struct ScanItem {
     int rssi;
 };
 
+struct WiFiScanItem {
+    String ssid;
+    int rssi;
+    bool open;
+};
+
 static std::vector<ScanItem> scanItems;
+static std::vector<WiFiScanItem> wifiItems;
 
 static String jsonEscape(const String& in) {
     String out;
@@ -54,6 +62,208 @@ static String jsonEscape(const String& in) {
 static void setStatus(const String& s) {
     lastStatus = s;
     Serial.println("[STATUS] " + s);
+}
+
+static void printWebAddresses() {
+    Serial.println();
+    Serial.println("[WEB] Access:");
+    Serial.printf("  AP  : http://%s  (%s / %s)\n",
+                  WiFi.softAPIP().toString().c_str(), AP_SSID, AP_PASS);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("  LAN : http://%s  SSID=\"%s\" RSSI=%d dBm\n",
+                      WiFi.localIP().toString().c_str(),
+                      WiFi.SSID().c_str(),
+                      WiFi.RSSI());
+    } else {
+        Serial.println("  LAN : not connected");
+    }
+    Serial.println();
+}
+
+static void scanWiFiConsole() {
+    Serial.println();
+    Serial.println("====================================");
+    Serial.println(" WIFI SCAN");
+    Serial.println("====================================");
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.scanDelete();
+
+    const int count = WiFi.scanNetworks(false, true);
+    wifiItems.clear();
+
+    if (count <= 0) {
+        Serial.println("[WIFI] No networks found");
+        return;
+    }
+
+    wifiItems.reserve(count);
+
+    for (int i = 0; i < count; ++i) {
+        WiFiScanItem item;
+        item.ssid = WiFi.SSID(i);
+        item.rssi = WiFi.RSSI(i);
+        item.open = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN);
+        wifiItems.push_back(item);
+
+        Serial.printf("[%d] RSSI=%d  %s  SSID=\"%s\"\n",
+                      i + 1,
+                      item.rssi,
+                      item.open ? "OPEN " : "LOCK ",
+                      item.ssid.c_str());
+    }
+
+    WiFi.scanDelete();
+
+    Serial.println();
+    Serial.println("Connect by index:");
+    Serial.println("  wifi <N> <password>");
+    Serial.println("Examples:");
+    Serial.println("  wifi 3 mypassword");
+    Serial.println("  wifi 2              (open network)");
+}
+
+static bool connectWiFi(const String& ssid, const String& password, bool saveCreds) {
+    if (ssid.length() == 0) {
+        Serial.println("[WIFI] Empty SSID");
+        return false;
+    }
+
+    Serial.printf("[WIFI] Connecting to \"%s\"", ssid.c_str());
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false, false);
+    delay(150);
+
+    if (password.length()) {
+        WiFi.begin(ssid.c_str(), password.c_str());
+    } else {
+        WiFi.begin(ssid.c_str());
+    }
+
+    const uint32_t started = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - started < 15000) {
+        Serial.print('.');
+        server.handleClient();
+        delay(250);
+    }
+    Serial.println();
+
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.printf("[WIFI] FAILED, status=%d\n", (int)WiFi.status());
+        return false;
+    }
+
+    Serial.println("[WIFI] CONNECTED");
+    Serial.printf("[WIFI] SSID: %s\n", WiFi.SSID().c_str());
+    Serial.printf("[WIFI] IP  : %s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[WIFI] RSSI: %d dBm\n", WiFi.RSSI());
+
+    if (saveCreds) {
+        prefs.putString("wifi_ssid", ssid);
+        prefs.putString("wifi_pass", password);
+        Serial.println("[WIFI] Credentials saved");
+    }
+
+    printWebAddresses();
+    return true;
+}
+
+static void connectSavedWiFi() {
+    if (!prefs.isKey("wifi_ssid")) {
+        Serial.println("[WIFI] No saved WiFi");
+        return;
+    }
+
+    const String ssid = prefs.getString("wifi_ssid", "");
+    const String pass = prefs.getString("wifi_pass", "");
+
+    if (ssid.length() == 0) {
+        return;
+    }
+
+    Serial.printf("[WIFI] Saved network: \"%s\"\n", ssid.c_str());
+    connectWiFi(ssid, pass, false);
+}
+
+static void forgetWiFi() {
+    prefs.remove("wifi_ssid");
+    prefs.remove("wifi_pass");
+    WiFi.disconnect(false, true);
+    Serial.println("[WIFI] Saved WiFi removed");
+    printWebAddresses();
+}
+
+static void handleConsoleLine(String line) {
+    line.trim();
+    if (!line.length()) return;
+
+    if (line.equalsIgnoreCase("help") || line == "?") {
+        Serial.println();
+        Serial.println("Console commands:");
+        Serial.println("  W                     WiFi scan (shortcut)");
+        Serial.println("  wifi scan             WiFi scan");
+        Serial.println("  wifi <N> <password>   connect to scanned network N");
+        Serial.println("  wifi status           show WiFi/AP IP addresses");
+        Serial.println("  wifi forget           erase saved WiFi credentials");
+        Serial.println("  F                     Find/vibrate bound watch");
+        Serial.println("  E                     Enable watch notifications");
+        Serial.println("  T                     Send TEST notification");
+        Serial.println("  S                     BLE scan 6s");
+        Serial.println("  C                     Connect bound watch");
+        return;
+    }
+
+    if (line.equalsIgnoreCase("wifi scan")) {
+        scanWiFiConsole();
+        return;
+    }
+
+    if (line.equalsIgnoreCase("wifi status")) {
+        printWebAddresses();
+        return;
+    }
+
+    if (line.equalsIgnoreCase("wifi forget")) {
+        forgetWiFi();
+        return;
+    }
+
+    if (line.startsWith("wifi ")) {
+        String args = line.substring(5);
+        args.trim();
+
+        const int space = args.indexOf(' ');
+        String indexText;
+        String password;
+
+        if (space < 0) {
+            indexText = args;
+        } else {
+            indexText = args.substring(0, space);
+            password = args.substring(space + 1);
+            password.trim();
+        }
+
+        const int index = indexText.toInt();
+        if (index < 1 || index > (int)wifiItems.size()) {
+            Serial.println("[WIFI] Bad index. Run 'W' or 'wifi scan' first.");
+            return;
+        }
+
+        const WiFiScanItem& item = wifiItems[index - 1];
+        if (!item.open && password.length() == 0) {
+            Serial.println("[WIFI] This network needs a password.");
+            Serial.printf("Use: wifi %d <password>\n", index);
+            return;
+        }
+
+        connectWiFi(item.ssid, password, true);
+        return;
+    }
+
+    Serial.println("[CONSOLE] Unknown command. Type: help");
 }
 
 static void notifyCallback(
@@ -298,7 +508,7 @@ button,input{font-size:16px;padding:9px;margin:4px;border-radius:7px;border:1px 
 button{cursor:pointer}
 .dev{display:flex;gap:8px;align-items:center;justify-content:space-between;border-top:1px solid #333;padding:8px 0}
 small{color:#aaa}
-#status,#rx{white-space:pre-wrap;overflow-wrap:anywhere}
+#status,#rx,#net{white-space:pre-wrap;overflow-wrap:anywhere}
 input[type=text]{width:90%;background:#111;color:#eee}
 .ok{color:#8f8}.bad{color:#f88}
 </style>
@@ -309,7 +519,8 @@ input[type=text]{width:90%;background:#111;color:#eee}
 <div class="card">
 <b>Status</b>
 <div id="status">loading...</div>
-<small>AP: WatchBridge-S3 / 12345678 · http://192.168.4.1</small>
+<div id="net">network...</div>
+<small>Fallback AP: WatchBridge-S3 / 12345678 · http://192.168.4.1</small>
 </div>
 
 <div class="card">
@@ -345,71 +556,26 @@ input[type=text]{width:90%;background:#111;color:#eee}
 </div>
 
 <script>
-async function j(url){
-  let r=await fetch(url);
-  return await r.json();
-}
-
+async function j(url){let r=await fetch(url);return await r.json()}
 async function refresh(){
   try{
     let x=await j('/api/status');
-    status.textContent=x.status+'\nconnected='+x.connected;
+    status.textContent=x.status+'\nwatch_connected='+x.connected;
     status.className=x.connected?'ok':'';
     bound.textContent=x.bound||'not bound';
     rx.textContent=x.last_rx||'none';
-  }catch(e){
-    status.textContent='web/API error: '+e;
-    status.className='bad';
-  }
+    net.textContent=x.wifi_connected
+      ? 'WiFi: '+x.wifi_ssid+'  '+x.wifi_ip+'  '+x.wifi_rssi+' dBm'
+      : 'WiFi: not connected; use serial console W / wifi <N> <password>';
+  }catch(e){status.textContent='web/API error: '+e;status.className='bad'}
 }
-
-async function scan(){
-  status.textContent='scanning...';
-  let x=await j('/api/scan');
-  devices.innerHTML='';
-  x.devices.forEach(d=>{
-    let e=document.createElement('div');
-    e.className='dev';
-    let t=document.createElement('span');
-    t.textContent=(d.name||'(no name)')+'  '+d.mac+'  '+d.rssi+' dBm';
-    let b=document.createElement('button');
-    b.textContent='Bind';
-    b.onclick=()=>bind(d.mac);
-    e.append(t,b);
-    devices.appendChild(e);
-  });
-  refresh();
-}
-
-async function bind(mac){
-  await j('/api/bind?mac='+encodeURIComponent(mac));
-  await refresh();
-}
-
-async function unbind(){
-  await j('/api/unbind');
-  await refresh();
-}
-
-async function connectWatch(){
-  await j('/api/connect');
-  await refresh();
-}
-
-async function cmd(c){
-  await j('/api/cmd?name='+encodeURIComponent(c));
-  setTimeout(refresh,200);
-}
-
-async function sendText(){
-  let s=document.getElementById('sender').value;
-  let t=document.getElementById('msgtext').value;
-  await j('/api/send?sender='+encodeURIComponent(s)+'&text='+encodeURIComponent(t));
-  setTimeout(refresh,200);
-}
-
-refresh();
-setInterval(refresh,2500);
+async function scan(){status.textContent='scanning...';let x=await j('/api/scan');devices.innerHTML='';x.devices.forEach(d=>{let e=document.createElement('div');e.className='dev';let t=document.createElement('span');t.textContent=(d.name||'(no name)')+'  '+d.mac+'  '+d.rssi+' dBm';let b=document.createElement('button');b.textContent='Bind';b.onclick=()=>bind(d.mac);e.append(t,b);devices.appendChild(e)});refresh()}
+async function bind(mac){await j('/api/bind?mac='+encodeURIComponent(mac));await refresh()}
+async function unbind(){await j('/api/unbind');await refresh()}
+async function connectWatch(){await j('/api/connect');await refresh()}
+async function cmd(c){await j('/api/cmd?name='+encodeURIComponent(c));setTimeout(refresh,200)}
+async function sendText(){let s=document.getElementById('sender').value;let t=document.getElementById('msgtext').value;await j('/api/send?sender='+encodeURIComponent(s)+'&text='+encodeURIComponent(t));setTimeout(refresh,200)}
+refresh();setInterval(refresh,2500)
 </script>
 </body>
 </html>
@@ -420,44 +586,38 @@ static void apiStatus() {
     s += "\"connected\":" + String(connected ? "true" : "false") + ",";
     s += "\"bound\":\"" + jsonEscape(boundMac) + "\",";
     s += "\"status\":\"" + jsonEscape(lastStatus) + "\",";
-    s += "\"last_rx\":\"" + jsonEscape(lastRx) + "\"";
+    s += "\"last_rx\":\"" + jsonEscape(lastRx) + "\",";
+    s += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+    s += "\"wifi_ssid\":\"" + jsonEscape(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "") + "\",";
+    s += "\"wifi_ip\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\",";
+    s += "\"wifi_rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
     s += "}";
-
     server.send(200, "application/json", s);
 }
 
 static void apiScan() {
     runScan();
-
     String s = "{\"devices\":[";
-
     for (size_t i = 0; i < scanItems.size(); ++i) {
         if (i) s += ',';
-
         s += "{\"mac\":\"" + jsonEscape(scanItems[i].mac) + "\",";
         s += "\"name\":\"" + jsonEscape(scanItems[i].name) + "\",";
         s += "\"rssi\":" + String(scanItems[i].rssi) + "}";
     }
-
     s += "]}";
     server.send(200, "application/json", s);
 }
 
 static void apiBind() {
     const String mac = server.arg("mac");
-
     if (mac.length() != 17) {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"bad mac\"}");
         return;
     }
-
     boundMac = mac;
     prefs.putString("watch_mac", boundMac);
-
     const bool ok = connectWatch(boundMac);
-
-    server.send(200, "application/json",
-                String("{\"ok\":") + (ok ? "true" : "false") + "}");
+    server.send(200, "application/json", String("{\"ok\":") + (ok ? "true" : "false") + "}");
 }
 
 static void apiUnbind() {
@@ -465,59 +625,41 @@ static void apiUnbind() {
     boundMac = "";
     prefs.remove("watch_mac");
     setStatus("watch unbound");
-
     server.send(200, "application/json", "{\"ok\":true}");
 }
 
 static void apiConnect() {
     const bool ok = connectWatch(boundMac);
-
-    server.send(200, "application/json",
-                String("{\"ok\":") + (ok ? "true" : "false") + "}");
+    server.send(200, "application/json", String("{\"ok\":") + (ok ? "true" : "false") + "}");
 }
 
 static void apiCmd() {
     const String name = server.arg("name");
     bool ok = false;
-
-    if (name == "find") {
-        ok = testFindWatch();
-    } else if (name == "enable") {
-        ok = enableNotifications();
-    } else if (name == "test") {
-        ok = sendNotification("MeshCore", "TEST FROM ESP32-S3");
-    } else {
+    if (name == "find") ok = testFindWatch();
+    else if (name == "enable") ok = enableNotifications();
+    else if (name == "test") ok = sendNotification("MeshCore", "TEST FROM ESP32-S3");
+    else {
         server.send(400, "application/json", "{\"ok\":false,\"error\":\"unknown command\"}");
         return;
     }
-
-    server.send(200, "application/json",
-                String("{\"ok\":") + (ok ? "true" : "false") + "}");
+    server.send(200, "application/json", String("{\"ok\":") + (ok ? "true" : "false") + "}");
 }
 
 static void apiSend() {
     const String sender = server.arg("sender").length() ? server.arg("sender") : "MeshCore";
     const String text = server.arg("text");
-
     const bool ok = sendNotification(sender, text);
-
-    server.send(200, "application/json",
-                String("{\"ok\":") + (ok ? "true" : "false") + "}");
+    server.send(200, "application/json", String("{\"ok\":") + (ok ? "true" : "false") + "}");
 }
 
 static void startWeb() {
-    WiFi.mode(WIFI_AP);
-
+    WiFi.mode(WIFI_AP_STA);
     const bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
-
     Serial.printf("[WEB] softAP: %s\n", apOk ? "OK" : "FAIL");
-    Serial.print("[WEB] AP IP: ");
-    Serial.println(WiFi.softAPIP());
+    Serial.printf("[WEB] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
 
-    server.on("/", HTTP_GET, []() {
-        server.send_P(200, "text/html", INDEX_HTML);
-    });
-
+    server.on("/", HTTP_GET, [](){ server.send_P(200, "text/html", INDEX_HTML); });
     server.on("/api/status", HTTP_GET, apiStatus);
     server.on("/api/scan", HTTP_GET, apiScan);
     server.on("/api/bind", HTTP_GET, apiBind);
@@ -525,28 +667,35 @@ static void startWeb() {
     server.on("/api/connect", HTTP_GET, apiConnect);
     server.on("/api/cmd", HTTP_GET, apiCmd);
     server.on("/api/send", HTTP_GET, apiSend);
-
-    server.onNotFound([]() {
-        server.send(404, "application/json", "{\"error\":\"not found\"}");
-    });
-
+    server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
     server.begin();
     Serial.println("[WEB] server started");
 }
 
-static void printHelp() {
+static void printBleScanToSerial() {
+    for (const auto& x : scanItems) {
+        Serial.printf("[SCAN] %s RSSI=%d NAME=\"%s\"\n",
+                      x.mac.c_str(), x.rssi, x.name.c_str());
+    }
+}
+
+static void printCommands() {
     Serial.println();
     Serial.println("Commands:");
+    Serial.println("  W = WiFi scan");
+    Serial.println("      then: wifi <N> <password>");
+    Serial.println("  wifi status / wifi forget");
     Serial.println("  F = Find/vibrate bound watch");
     Serial.println("  E = Enable notifications");
     Serial.println("  T = Send TEST notification");
     Serial.println("  S = BLE scan 6s");
     Serial.println("  C = Connect bound watch");
+    Serial.println("  help = full help");
 }
 
 void setup() {
     Serial.begin(115200);
-    delay(1500);
+    delay(1600);
 
     Serial.println();
     Serial.println("====================================");
@@ -554,45 +703,87 @@ void setup() {
     Serial.println("====================================");
 
     prefs.begin("watchbridge", false);
-    boundMac = prefs.getString("watch_mac", "");
 
-    NimBLEDevice::init("S3-WatchBridge");
+    if (prefs.isKey("watch_mac")) {
+        boundMac = prefs.getString("watch_mac", "");
+    } else {
+        boundMac = "";
+    }
+
+    NimBLEDevice::init("ESP32-S3-WatchBridge");
     NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
     startWeb();
+    connectSavedWiFi();
+    printWebAddresses();
+    printCommands();
 
     if (boundMac.length()) {
-        Serial.println("[NVS] bound watch: " + boundMac);
+        Serial.println("[BLE] saved watch: " + boundMac);
         connectWatch(boundMac);
     } else {
         setStatus("ready - no watch bound");
     }
-
-    printHelp();
 }
 
 void loop() {
     server.handleClient();
 
-    if (Serial.available()) {
-        const char c = Serial.read();
-
-        if (c == 'f' || c == 'F') {
-            testFindWatch();
-        } else if (c == 'e' || c == 'E') {
-            enableNotifications();
-        } else if (c == 't' || c == 'T') {
-            sendNotification("MeshCore", "TEST FROM ESP32-S3");
-        } else if (c == 's' || c == 'S') {
-            runScan();
-            for (const auto& d : scanItems) {
-                Serial.printf("[SCAN] %s RSSI=%d NAME=\"%s\"\n",
-                              d.mac.c_str(), d.rssi, d.name.c_str());
+    if (WiFi.status() != WL_CONNECTED && prefs.isKey("wifi_ssid")) {
+        static uint32_t lastRetry = 0;
+        if (millis() - lastRetry > 30000) {
+            lastRetry = millis();
+            const String ssid = prefs.getString("wifi_ssid", "");
+            const String pass = prefs.getString("wifi_pass", "");
+            if (ssid.length()) {
+                Serial.println("[WIFI] reconnecting saved network...");
+                connectWiFi(ssid, pass, false);
             }
-        } else if (c == 'c' || c == 'C') {
-            connectWatch(boundMac);
         }
     }
 
-    delay(2);
+    while (Serial.available()) {
+        const char c = Serial.read();
+
+        if (serialLine.length() == 0) {
+            if (c == 'W') {
+                scanWiFiConsole();
+                continue;
+            }
+            if (c == 'F') {
+                testFindWatch();
+                continue;
+            }
+            if (c == 'E') {
+                enableNotifications();
+                continue;
+            }
+            if (c == 'T') {
+                sendNotification("MeshCore", "TEST FROM ESP32-S3");
+                continue;
+            }
+            if (c == 'S') {
+                runScan();
+                printBleScanToSerial();
+                continue;
+            }
+            if (c == 'C') {
+                connectWatch(boundMac);
+                continue;
+            }
+        }
+
+        if (c == '\r' || c == '\n') {
+            if (serialLine.length()) {
+                handleConsoleLine(serialLine);
+                serialLine = "";
+            }
+        } else if (c == 8 || c == 127) {
+            if (serialLine.length()) serialLine.remove(serialLine.length() - 1);
+        } else if (c >= 32 && c <= 126) {
+            if (serialLine.length() < 160) serialLine += c;
+        }
+    }
+
+    delay(5);
 }
